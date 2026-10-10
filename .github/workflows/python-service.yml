@@ -1,0 +1,140 @@
+# Shared CI for every Python service created from the idp golden path.
+#
+# A service repo calls this workflow instead of copying a pipeline (its ci.yml is ~15 lines).
+# What "CI" means is therefore decided here, once: a fix or a new check reaches every service
+# by bumping the commit a caller pins, which Dependabot proposes as a pull request.
+#
+#   check   lint (ruff), format check, type check (mypy), tests + coverage gate (pytest)
+#   image   build the arm64 image, scan it (Trivy), and on main push it to ECR svc/<repo>
+#
+# Nothing here deploys. Argo CD Image Updater sees the new image in ECR and commits the tag
+# to idp-gitops; service repos hold no credential that can write to the deploy repo.
+#
+# What a caller repo must contain is listed in README.md ("The contract").
+name: python-service
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory of the service inside the repo.
+        type: string
+        default: "."
+      push:
+        description: >-
+          Push the image to ECR on pushes to main. Set false to build and scan only
+          (this repo's own test does that).
+        type: boolean
+        default: true
+
+# Each job asks for what it needs; the caller must grant contents: read and id-token: write.
+permissions: {}
+
+env:
+  UV_VERSION: "0.12.19"
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          working-directory: ${{ inputs.working-directory }}
+
+      # --locked: fail when uv.lock does not match pyproject.toml, instead of resolving
+      # different versions than the developer tested.
+      - name: Install dependencies from the lock file
+        run: uv sync --locked
+
+      - name: Lint
+        run: uv run ruff check --output-format=github .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      # The coverage gate is the service's own setting (pyproject.toml, fail_under).
+      - name: Tests
+        run: uv run pytest
+
+  image:
+    needs: check
+    runs-on: ubuntu-24.04-arm         # native arm64 = the EKS nodes' architecture
+    permissions:
+      contents: read
+      id-token: write                 # OIDC to AWS, no stored credentials
+    env:
+      REGISTRY: 693906847772.dkr.ecr.ap-south-1.amazonaws.com
+      REPO: svc/${{ github.event.repository.name }}
+      PUSH: ${{ inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          docker build \
+            --build-arg "GIT_SHA=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -t "${REGISTRY}/${REPO}:${GITHUB_SHA}" .
+
+      # HIGH/CRITICAL with a fix available fails the job, so the image is never pushed.
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.REPO }}:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+
+      - name: Configure AWS credentials via OIDC
+        if: env.PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          # Narrow role: can only create/push ECR repos under svc/*
+          role-to-assume: arn:aws:iam::693906847772:role/idp-service-ci
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        if: env.PUSH == 'true'
+        uses: aws-actions/amazon-ecr-login@03f1aad4c6c7ffd436567f42f9384779290529bd # v2.1.7
+
+      - name: Ensure ECR repository exists
+        if: env.PUSH == 'true'
+        run: |
+          if ! aws ecr describe-repositories --repository-names "$REPO" >/dev/null 2>&1; then
+            aws ecr create-repository --repository-name "$REPO" \
+              --image-tag-mutability IMMUTABLE \
+              --image-scanning-configuration scanOnPush=true \
+              --tags Key=Project,Value=idp Key=ManagedBy,Value=golden-path-ci
+            aws ecr put-lifecycle-policy --repository-name "$REPO" --lifecycle-policy-text \
+              '{"rules":[{"rulePriority":1,"description":"keep last 10","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+          fi
+
+      # A re-run of a green build: the SHA tag is immutable and already in ECR.
+      - name: Push image
+        if: env.PUSH == 'true'
+        run: |
+          if aws ecr describe-images --repository-name "$REPO" \
+               --image-ids imageTag="${GITHUB_SHA}" >/dev/null 2>&1; then
+            echo "Image ${GITHUB_SHA} already in ECR - skipping push"
+          else
+            docker push "${REGISTRY}/${REPO}:${GITHUB_SHA}"
+          fi

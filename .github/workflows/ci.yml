@@ -1,0 +1,38 @@
+# This repo's own checks: lint the workflows, then run the shared workflow for real against
+# a small service (tests/fixture-service), without pushing an image. A change that breaks
+# the shared CI fails here, before any service repo picks it up.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.sha }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: actionlint (pinned by digest)
+        run: |
+          docker run --rm -v "$PWD:/repo" --workdir /repo \
+            rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+
+  python-service:
+    uses: ./.github/workflows/python-service.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      working-directory: tests/fixture-service
+      push: false
