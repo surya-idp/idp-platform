@@ -232,12 +232,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           IMAGE: oci://${{ env.REGISTRY }}/${{ env.REPO }}@${{ steps.digest.outputs.digest }}
           SIGNER: ${{ github.repository_owner }}/idp-platform/.github/workflows/python-service.yml
+        shell: bash   # pipefail: a failed verification must fail the step, not the jq after it
         run: |
+          set -o pipefail
+          # --format json: print what was verified instead of trusting a silent exit code.
+          show() { jq -r '.[] | "  verified: \(.verificationResult.statement.predicateType)  signed by: \(.verificationResult.signature.certificate.buildSignerURI)"'; }
           echo "== provenance, signed by the shared workflow"
-          gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$SIGNER"
+          gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$SIGNER" \
+            --format json | show
           echo "== SBOM"
           gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$SIGNER" \
-            --predicate-type https://cyclonedx.org/bom
+            --predicate-type https://cyclonedx.org/bom --format json | show
           echo "== negative: a different signer workflow must be rejected"
           if gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" \
                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" >/dev/null 2>&1; then
