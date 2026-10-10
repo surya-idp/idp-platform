@@ -165,6 +165,9 @@ jobs:
         run: |
           docker run -d --name registry -p 5000:5000 registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
           for _ in $(seq 1 20); do curl -sf http://localhost:5000/v2/ >/dev/null && break; sleep 1; done
+          # The registry has no authentication, but the attest step insists on finding an
+          # entry for it in the docker config. Any name and password are accepted.
+          echo self-test | docker login localhost:5000 -u self-test --password-stdin
           docker push "${REGISTRY}/${REPO}:${GITHUB_SHA}"
 
       # ---- attest what was pushed --------------------------------------------------------
