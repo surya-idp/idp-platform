@@ -5,7 +5,17 @@
 # by bumping the commit a caller pins, which Dependabot proposes as a pull request.
 #
 #   check   lint (ruff), format check, type check (mypy), tests + coverage gate (pytest)
-#   image   build the arm64 image, scan it (Trivy), and on main push it to ECR svc/<repo>
+#   image   build the arm64 image, scan it (Trivy), and on main push it to ECR svc/<repo>,
+#           then attest it: signed build provenance + a signed SBOM, stored next to the image
+#
+# Why attest: a tag in a registry proves nothing about where an image came from. An
+# attestation is a statement ("this digest was built by this workflow, from this commit, and
+# contains these packages") signed with a short-lived certificate that Sigstore issues to this
+# workflow run. There is no signing key to store or leak. Anyone can check it:
+#   gh attestation verify oci://<image>@<digest> --owner surya-idp \
+#     --signer-workflow surya-idp/idp-platform/.github/workflows/python-service.yml
+# --signer-workflow is the point of doing this in a SHARED workflow: the signer is this file,
+# not the service repo, so a service cannot produce a valid attestation with its own pipeline.
 #
 # Nothing here deploys. Argo CD Image Updater sees the new image in ECR and commits the tag
 # to idp-gitops; service repos hold no credential that can write to the deploy repo.
@@ -22,12 +32,19 @@ on:
         default: "."
       push:
         description: >-
-          Push the image to ECR on pushes to main. Set false to build and scan only
-          (this repo's own test does that).
+          Push the image to ECR on pushes to main. Set false to build and scan only.
         type: boolean
         default: true
+      registry-self-test:
+        description: >-
+          Only for this repo's own CI. Pushes to a throwaway registry started inside the job
+          instead of ECR, on every run, then attests the image and verifies the attestations.
+          Exercises push, signing and verification without AWS.
+        type: boolean
+        default: false
 
-# Each job asks for what it needs; the caller must grant contents: read and id-token: write.
+# Each job asks for what it needs; the caller must grant contents: read, id-token: write and
+# attestations: write (the last one since v2.0.0).
 permissions: {}
 
 env:
@@ -74,11 +91,14 @@ jobs:
     runs-on: ubuntu-24.04-arm         # native arm64 = the EKS nodes' architecture
     permissions:
       contents: read
-      id-token: write                 # OIDC to AWS, no stored credentials
+      id-token: write                 # OIDC to AWS (no stored credentials) and to Sigstore (signing)
+      attestations: write             # store the attestations with GitHub
     env:
-      REGISTRY: 693906847772.dkr.ecr.ap-south-1.amazonaws.com
+      REGISTRY: ${{ inputs.registry-self-test && 'localhost:5000' || '693906847772.dkr.ecr.ap-south-1.amazonaws.com' }}
       REPO: svc/${{ github.event.repository.name }}
-      PUSH: ${{ inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # ECR: only main is pushed. Self-test: every run, into a registry that dies with the job.
+      PUSH: ${{ !inputs.registry-self-test && inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      SELF_TEST: ${{ inputs.registry-self-test }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -125,7 +145,7 @@ jobs:
               --image-scanning-configuration scanOnPush=true \
               --tags Key=Project,Value=idp Key=ManagedBy,Value=golden-path-ci
             aws ecr put-lifecycle-policy --repository-name "$REPO" --lifecycle-policy-text \
-              '{"rules":[{"rulePriority":1,"description":"keep last 10","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}'
+              '{"rules":[{"rulePriority":1,"description":"keep last 40 artifacts (an image plus its two attestations = 3)","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":40},"action":{"type":"expire"}}]}'
           fi
 
       # A re-run of a green build: the SHA tag is immutable and already in ECR.
@@ -138,3 +158,94 @@ jobs:
           else
             docker push "${REGISTRY}/${REPO}:${GITHUB_SHA}"
           fi
+
+      # ---- self-test only: a registry that lives for this job ---------------------------
+      - name: Start a throwaway registry and push to it (self-test)
+        if: env.SELF_TEST == 'true'
+        run: |
+          # With basic authentication, like ECR: the attest step answers a registry's
+          # authentication challenge and fails on a registry that sends none.
+          mkdir -p "$RUNNER_TEMP/registry-auth"
+          docker run --rm --entrypoint htpasswd httpd:2.4-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889 \
+            -Bbn self-test self-test > "$RUNNER_TEMP/registry-auth/htpasswd"
+          docker run -d --name registry -p 5000:5000 \
+            -v "$RUNNER_TEMP/registry-auth:/auth:ro" \
+            -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=self-test \
+            -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+            registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+          for _ in $(seq 1 20); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/v2/)" = 401 ] && break; sleep 1
+          done
+          echo self-test | docker login localhost:5000 -u self-test --password-stdin
+          docker push "${REGISTRY}/${REPO}:${GITHUB_SHA}"
+
+      # ---- attest what was pushed --------------------------------------------------------
+      # The subject is the image DIGEST, not the tag: a digest names exactly one image.
+      - name: Image digest
+        id: digest
+        if: env.PUSH == 'true' || env.SELF_TEST == 'true'
+        run: |
+          digest="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+            "${REGISTRY}/${REPO}:${GITHUB_SHA}" | grep "^${REGISTRY}/${REPO}@" | head -1 | cut -d@ -f2)"
+          # A re-run that skipped the push has no local repo digest: ask the registry.
+          if [ -z "$digest" ] && [ "$PUSH" = "true" ]; then
+            digest="$(aws ecr describe-images --repository-name "$REPO" \
+              --image-ids imageTag="${GITHUB_SHA}" --query 'imageDetails[0].imageDigest' --output text)"
+          fi
+          case "$digest" in sha256:*) ;; *) echo "no image digest found"; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Image: ${REGISTRY}/${REPO}@${digest}"
+
+      - name: SBOM (CycloneDX, every package in the image)
+        if: steps.digest.outputs.digest != ''
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.REPO }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom.cdx.json
+          exit-code: '0'
+
+      # SLSA build provenance: which workflow, which commit, which runner built this digest.
+      - name: Attest build provenance
+        if: steps.digest.outputs.digest != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.REPO }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true          # stored next to the image, for admission checks later
+          create-storage-record: false
+
+      - name: Attest SBOM
+        if: steps.digest.outputs.digest != ''
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.REPO }}
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          sbom-path: sbom.cdx.json
+          push-to-registry: true
+          create-storage-record: false
+
+      # ---- self-test only: prove the attestations verify, and that a wrong signer does not ---
+      - name: Verify the attestations (self-test)
+        if: env.SELF_TEST == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE: oci://${{ env.REGISTRY }}/${{ env.REPO }}@${{ steps.digest.outputs.digest }}
+          SIGNER: ${{ github.repository_owner }}/idp-platform/.github/workflows/python-service.yml
+        shell: bash   # pipefail: a failed verification must fail the step, not the jq after it
+        run: |
+          set -o pipefail
+          # --format json: print what was verified instead of trusting a silent exit code.
+          show() { jq -r '.[] | "  verified: \(.verificationResult.statement.predicateType)  signed by: \(.verificationResult.signature.certificate.buildSignerURI)"'; }
+          echo "== provenance, signed by the shared workflow"
+          gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$SIGNER" \
+            --format json | show
+          echo "== SBOM"
+          gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" --signer-workflow "$SIGNER" \
+            --predicate-type https://cyclonedx.org/bom --format json | show
+          echo "== negative: a different signer workflow must be rejected"
+          if gh attestation verify "$IMAGE" --repo "$GITHUB_REPOSITORY" \
+               --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml" >/dev/null 2>&1; then
+            echo "verification accepted the wrong signer"; exit 1
+          fi
+          echo "rejected, as it must be"

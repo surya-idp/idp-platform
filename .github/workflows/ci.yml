@@ -1,5 +1,6 @@
 # This repo's own checks: lint the workflows, then run the shared workflow for real against
-# a small service (tests/fixture-service), without pushing an image. A change that breaks
+# a small service (tests/fixture-service): check, build, scan, push to a throwaway registry,
+# attest, verify. Nothing reaches AWS. A change that breaks
 # the shared CI fails here, before any service repo picks it up.
 name: CI
 
@@ -33,6 +34,9 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      attestations: write
     with:
       working-directory: tests/fixture-service
-      push: false
+      # No AWS: the image goes to a registry inside the job, is attested there, and the
+      # attestations are verified (including a wrong-signer check).
+      registry-self-test: true
