@@ -163,10 +163,19 @@ jobs:
       - name: Start a throwaway registry and push to it (self-test)
         if: env.SELF_TEST == 'true'
         run: |
-          docker run -d --name registry -p 5000:5000 registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
-          for _ in $(seq 1 20); do curl -sf http://localhost:5000/v2/ >/dev/null && break; sleep 1; done
-          # The registry has no authentication, but the attest step insists on finding an
-          # entry for it in the docker config. Any name and password are accepted.
+          # With basic authentication, like ECR: the attest step answers a registry's
+          # authentication challenge and fails on a registry that sends none.
+          mkdir -p "$RUNNER_TEMP/registry-auth"
+          docker run --rm --entrypoint htpasswd httpd:2.4-alpine@sha256:3440c39d8d6f54fa9ad2549e5a60c19ddd435faadc29c1ad28aa795f71888889 \
+            -Bbn self-test self-test > "$RUNNER_TEMP/registry-auth/htpasswd"
+          docker run -d --name registry -p 5000:5000 \
+            -v "$RUNNER_TEMP/registry-auth:/auth:ro" \
+            -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=self-test \
+            -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd \
+            registry:3@sha256:ddf754342cfc8acc51a56d5d0ab6af06826461864460636d8bd5c546dab2a7b8
+          for _ in $(seq 1 20); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5000/v2/)" = 401 ] && break; sleep 1
+          done
           echo self-test | docker login localhost:5000 -u self-test --password-stdin
           docker push "${REGISTRY}/${REPO}:${GITHUB_SHA}"
 
