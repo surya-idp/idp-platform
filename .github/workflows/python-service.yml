@@ -95,10 +95,11 @@ jobs:
   image:
     needs: check
     runs-on: ubuntu-24.04-arm         # native arm64 = the EKS nodes' architecture
-    # One image build per branch at a time, in push order. Image Updater deploys the image
-    # that was BUILT last, so two merges seconds apart must not build side by side: the older
-    # commit could finish second and be deployed. If a third push arrives while one waits,
-    # GitHub drops the waiting one; the newest still wins.
+    # One image build per branch at a time. Image Updater deploys the image that was BUILT
+    # last, so the last image built must be the newest commit. Running one at a time is half
+    # of that; GitHub does not promise the ORDER (on 2026-10-11 two pushes one second apart
+    # ran newest first, and the older commit was deployed). The other half is the step "Only
+    # the newest commit is pushed" below.
     concurrency:
       group: image-${{ github.repository }}-${{ github.ref }}
       cancel-in-progress: false
@@ -110,12 +111,33 @@ jobs:
       REGISTRY: ${{ inputs.registry-self-test && 'localhost:5000' || '693906847772.dkr.ecr.ap-south-1.amazonaws.com' }}
       REPO: svc/${{ github.event.repository.name }}
       # ECR: only main is pushed. Self-test: every run, into a registry that dies with the job.
-      PUSH: ${{ !inputs.registry-self-test && inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      # Whether this run may push at all. The step "Only the newest commit is pushed" turns
+      # it into PUSH, which the later steps check.
+      MAY_PUSH: ${{ !inputs.registry-self-test && inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       SELF_TEST: ${{ inputs.registry-self-test }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # An image is pushed only for the commit that is the branch head RIGHT NOW. If a newer
+      # commit has arrived, its own run (which waits for this one, see `concurrency`) builds
+      # and pushes after us, so skipping here loses nothing, and pushing here could make an
+      # older commit the last image built. Either order of the two runs ends the same way:
+      # older first = both push, the newer one last; newer first = the older one skips.
+      - name: Only the newest commit is pushed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PUSH="$MAY_PUSH"
+          if [ "$MAY_PUSH" = "true" ]; then
+            head="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${GITHUB_REF_NAME}" --jq .object.sha)"
+            if [ "$head" != "$GITHUB_SHA" ]; then
+              echo "::notice::${GITHUB_REF_NAME} is already at ${head}; this commit (${GITHUB_SHA}) is built and scanned but not pushed. The run for ${head} pushes."
+              PUSH=false
+            fi
+          fi
+          echo "PUSH=$PUSH" >> "$GITHUB_ENV"
 
       - name: Build image
         working-directory: ${{ inputs.working-directory }}
