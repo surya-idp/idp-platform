@@ -7,6 +7,8 @@
 #   check   lint (ruff), format check, type check (mypy), tests + coverage gate (pytest)
 #   image   build the arm64 image, scan it (Trivy), and on main push it to ECR svc/<repo>,
 #           then attest it: signed build provenance + a signed SBOM, stored next to the image
+#   docs    if the repo has a mkdocs.yml: build its documentation site (TechDocs) on every
+#           run, and on main publish it to the docs bucket, where Backstage reads it
 #
 # Why attest: a tag in a registry proves nothing about where an image came from. An
 # attestation is a statement ("this digest was built by this workflow, from this commit, and
@@ -49,6 +51,10 @@ permissions: {}
 
 env:
   UV_VERSION: "0.12.19"
+  # TechDocs: the generator Backstage publishes, and the MkDocs plugin set it expects.
+  TECHDOCS_CLI_VERSION: "1.12.0"
+  TECHDOCS_CORE_VERSION: "1.7.1"
+  DOCS_BUCKET: idp-techdocs-693906847772
 
 jobs:
   check:
@@ -89,6 +95,13 @@ jobs:
   image:
     needs: check
     runs-on: ubuntu-24.04-arm         # native arm64 = the EKS nodes' architecture
+    # One image build per branch at a time, in push order. Image Updater deploys the image
+    # that was BUILT last, so two merges seconds apart must not build side by side: the older
+    # commit could finish second and be deployed. If a third push arrives while one waits,
+    # GitHub drops the waiting one; the newest still wins.
+    concurrency:
+      group: image-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write                 # OIDC to AWS (no stored credentials) and to Sigstore (signing)
@@ -249,3 +262,64 @@ jobs:
             echo "verification accepted the wrong signer"; exit 1
           fi
           echo "rejected, as it must be"
+
+  # Documentation as part of the golden path (Backstage TechDocs). Backstage in the cluster
+  # cannot build docs itself (its builder needs Docker), and the project recommends this split
+  # for production anyway: CI builds the site, object storage keeps it, Backstage only reads.
+  # A broken docs page fails the pull request, like a failing test.
+  docs:
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write                 # OIDC to AWS for the upload (main only)
+    env:
+      PUBLISH: ${{ !inputs.registry-self-test && inputs.push && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Does this repo have docs?
+        id: has
+        run: |
+          if [ -f mkdocs.yml ]; then echo "docs=true" >> "$GITHUB_OUTPUT"; else echo "No mkdocs.yml: nothing to build."; fi
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        if: steps.has.outputs.docs == 'true'
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: false
+
+      # Outside the repo folder: the generator refuses a source tree that contains links
+      # pointing out of it, and a virtualenv is full of them.
+      - name: Build the site
+        if: steps.has.outputs.docs == 'true'
+        run: |
+          uv venv --quiet "$RUNNER_TEMP/docs-venv"
+          uv pip install --quiet --python "$RUNNER_TEMP/docs-venv/bin/python" \
+            "mkdocs-techdocs-core==${TECHDOCS_CORE_VERSION}"
+          PATH="$RUNNER_TEMP/docs-venv/bin:$PATH" npx --yes "@techdocs/cli@${TECHDOCS_CLI_VERSION}" \
+            generate --no-docker --source-dir . --output-dir "$RUNNER_TEMP/site"
+          test -s "$RUNNER_TEMP/site/index.html"
+          test -s "$RUNNER_TEMP/site/techdocs_metadata.json"
+
+      - name: Configure AWS credentials via OIDC
+        if: steps.has.outputs.docs == 'true' && env.PUBLISH == 'true'
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        with:
+          role-to-assume: arn:aws:iam::693906847772:role/idp-service-ci
+          aws-region: ap-south-1
+
+      # Stored under default/component/<repo>/, which is where Backstage looks for the docs
+      # of the catalog entry component:default/<repo>.
+      - name: Publish to the docs bucket
+        if: steps.has.outputs.docs == 'true' && env.PUBLISH == 'true'
+        run: |
+          npx --yes "@techdocs/cli@${TECHDOCS_CLI_VERSION}" publish \
+            --publisher-type awsS3 --storage-name "$DOCS_BUCKET" \
+            --entity "default/Component/${{ github.event.repository.name }}" \
+            --directory "$RUNNER_TEMP/site"

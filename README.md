@@ -106,6 +106,7 @@ To release: merge to `main`, then tag the merge commit (`git tag v2.x.y && git p
 |---|---|
 | v1.0.0 | check + image (lint, types, tests, build, scan, push) |
 | v2.0.0 | attests every pushed image (provenance + SBOM). **Breaking:** callers must also grant `attestations: write` |
+| v2.1.0 | builds the repo's docs (if it has a `mkdocs.yml`) and publishes them on main to the docs bucket for Backstage TechDocs; image builds of one branch run one at a time, so the newest commit is always built last. No change needed in callers |
 
 ## How changes here are tested
 

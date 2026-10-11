@@ -1,0 +1,5 @@
+site_name: fixture-service
+nav:
+  - Overview: index.md
+plugins:
+  - techdocs-core
