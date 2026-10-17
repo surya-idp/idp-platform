@@ -69,7 +69,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: ${{ env.UV_VERSION }}
           working-directory: ${{ inputs.working-directory }}
@@ -161,7 +161,7 @@ jobs:
 
       - name: Configure AWS credentials via OIDC
         if: env.PUSH == 'true'
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           # Narrow role: can only create/push ECR repos under svc/*
           role-to-assume: arn:aws:iam::693906847772:role/idp-service-ci
@@ -310,7 +310,7 @@ jobs:
         run: |
           if [ -f mkdocs.yml ]; then echo "docs=true" >> "$GITHUB_OUTPUT"; else echo "No mkdocs.yml: nothing to build."; fi
 
-      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         if: steps.has.outputs.docs == 'true'
         with:
           version: ${{ env.UV_VERSION }}
@@ -331,7 +331,7 @@ jobs:
 
       - name: Configure AWS credentials via OIDC
         if: steps.has.outputs.docs == 'true' && env.PUBLISH == 'true'
-        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4.3.1
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::693906847772:role/idp-service-ci
           aws-region: ap-south-1
